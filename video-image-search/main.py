@@ -8,7 +8,7 @@ import sys
 import time
 from tokenizers import Tokenizer
 from safetensors.numpy import load_file  # 需要 pip install safetensors
-
+import ml_dtypes
 
 def download_file(url: str, save_path: str):
     """Download a file from a URL to a specified local path."""
@@ -330,6 +330,9 @@ def extract_text_feature(text: str, model_dir: str) -> np.ndarray:
 if __name__ == "__main__":
     # overall_start = time.time()
 
+    # Truncate precision to BF16 (only for precision experiments)
+    use_bf16 = True
+
     # 模型下载阶段
     download_start = time.time()
     download_models()
@@ -344,6 +347,9 @@ if __name__ == "__main__":
     print("正在加载视频帧特征...")
     video_feats = np.load("workdir/video_features.npy")
     video_feats = video_feats / np.linalg.norm(video_feats, axis=1, keepdims=True)
+    if use_bf16:
+        # Simulate BF16 quantization
+        video_feats = video_feats.astype(ml_dtypes.bfloat16).astype(np.float32)
     load_time = time.time() - load_start
     print(f"视频特征加载耗时: {load_time:.3f}秒")
     print()
