@@ -75,12 +75,20 @@ def load_image_from_array(image_array: np.ndarray) -> Image.Image:
 
 
 def preprocess_image(image: Image.Image, target_size: int = 224) -> np.ndarray:
-    """预处理图片为CLIP模型输入。"""
-    image = image.resize((target_size, target_size))
+    """预处理图片为CLIP模型输入，仿照官方_transform。"""
+    # Resize + BICUBIC
+    image = image.resize((target_size, target_size), Image.Resampling.BICUBIC)
+    # 转为RGB
+    if image.mode != "RGB":
+        image = image.convert("RGB")
     arr = np.array(image).astype("float32") / 255.0
-    arr = (arr - 0.48145466) / 0.26862954  # Normalize
+    # 官方归一化参数
+    mean = np.array([0.48145466, 0.4578275, 0.40821073])
+    std = np.array([0.26862954, 0.26130258, 0.27577711])
+    arr = (arr - mean) / std
     arr = np.transpose(arr, (2, 0, 1))  # HWC to CHW
     arr = np.expand_dims(arr, axis=0)  # Add batch dimension
+    arr = arr.astype("float32")  # 保证为float32
     return arr
 
 
@@ -96,7 +104,8 @@ def extract_features_from_arrays(
         image = load_image_from_array(image_array)
         input_tensor = preprocess_image(image)
         outputs = session.run(None, {"pixel_values": input_tensor})
-        features.append(outputs[0][0])
+        out = np.asarray(outputs[0])
+        features.append(out[0])
     return np.array(features)
 
 
