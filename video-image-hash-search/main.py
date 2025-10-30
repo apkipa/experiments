@@ -17,9 +17,7 @@ def calculate_phash(frame, hash_size=16):
     resized = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
 
     # 3. DCT 变换 (使用浮点型)
-    umat = cv2.UMat(np.float32(resized))
-    dct_umat = cv2.dct(umat)
-    dct = dct_umat.get()
+    dct = cv2.dct(np.float32(resized))
 
     # 4. 取左上角 hash_size x hash_size 低频区域
     dct_roi = dct[0:hash_size, 0:hash_size]
@@ -60,8 +58,10 @@ def main(workdir: str, top_n: int = 20):
     frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
     # 计算 query pHash
-    query_phash = calculate_phash(frame)
-    print(f"Query pHash shape: {query_phash.shape}, dtype: {query_phash.dtype}")
+    query_phashes = {}
+    for hs in [8, 12, 16]:
+        query_phashes[hs] = calculate_phash(frame, hash_size=hs)
+    print(f"Query pHashes shapes: {[query_phashes[hs].shape for hs in [8,12,16]]}")
 
     # 读取所有 pHash 文件
     phash_files = glob.glob(os.path.join(workdir, "*_phashes.npz"))
@@ -73,22 +73,26 @@ def main(workdir: str, top_n: int = 20):
     for file_path in phash_files:
         video_name = os.path.basename(file_path).replace("_phashes.npz", "")
         data = np.load(file_path)
-        phash_array = data['phashes']
         fps = data['fps']
-        for frame_idx, phash in enumerate(phash_array):
-            dist = hamming_distance(query_phash, phash)
-            time_sec = frame_idx / fps
-            results.append((dist, video_name, frame_idx, time_sec))
+        for hash_size in [8, 12, 16]:
+            phash_array = data[f'phashes_{hash_size}']
+            query_phash = query_phashes[hash_size]
+            for frame_idx, phash in enumerate(phash_array):
+                dist = hamming_distance(query_phash, phash)
+                time_sec = frame_idx / fps
+                results.append((dist, video_name, frame_idx, time_sec, hash_size))
 
-    # 排序，取 top n
-    results.sort(key=lambda x: x[0])
-    top_results = results[:top_n]
-
-    print(f"Top {top_n} matches:")
-    for dist, video_name, frame_idx, time_sec in top_results:
-        time_formatted = str(datetime.timedelta(seconds=time_sec)).split('.')[0]
-        video_name_display = video_name if len(video_name) <= 20 else video_name[:17] + "..."
-        print(f"距离: {dist}, Video: {video_name_display}, Frame: {frame_idx}, Time: {time_sec:.2f} s ({time_formatted})")
+    # 排序，取 top n for each hash_size
+    for hs in [8, 12, 16]:
+        results_hs = [(dist, video_name, frame_idx, time_sec) for dist, video_name, frame_idx, time_sec, h in results if h == hs]
+        results_hs.sort(key=lambda x: x[0])
+        top_results_hs = results_hs[:top_n]
+        print(f"Top {top_n} matches for hash_size {hs}:")
+        for dist, video_name, frame_idx, time_sec in top_results_hs:
+            time_formatted = str(datetime.timedelta(seconds=time_sec)).split('.')[0]
+            video_name_display = video_name if len(video_name) <= 20 else video_name[:17] + "..."
+            print(f"距离: {dist}, Video: {video_name_display}, Frame: {frame_idx}, Time: {time_sec:.2f} s ({time_formatted})")
+        print()
 
 if __name__ == "__main__":
     workdir = "workdir"

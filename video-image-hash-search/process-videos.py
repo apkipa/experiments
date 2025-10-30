@@ -2,9 +2,11 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 import cv2
 import numpy as np
+import queue
+import threading
 
 def calculate_phash(frame, hash_size=16):
     """
@@ -33,8 +35,31 @@ def calculate_phash(frame, hash_size=16):
     # 然后 np.packbits 将其打包为 (32,) 的 uint8 数组
     return np.packbits(hash_bits.flatten())
 
-def extract_phashes(video_path: str, fps: float = 0, hash_size=16) -> tuple[List[np.ndarray], float]:
-    """使用ffmpeg pipe流式读取视频帧，计算pHash，不保存原始帧到内存。fps=0 表示使用视频原始帧率。"""
+def frame_reader(proc, frame_size, height, width, frame_queues):
+    try:
+        while True:
+            raw = proc.stdout.read(frame_size)
+            if len(raw) < frame_size:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+            for q in frame_queues:
+                q.put(frame)
+    finally:
+        proc.stdout.close()
+        proc.wait()
+    for q in frame_queues:
+        q.put(None)
+
+def phash_worker(hs, frame_queue, phashes):
+    while True:
+        frame = frame_queue.get()
+        if frame is None:
+            break
+        phash = calculate_phash(frame, hs)
+        phashes[hs].append(phash)
+
+def extract_phashes(video_path: str, hash_sizes: List[int], fps: float = 0, use_ffmpeg_resize: bool = False) -> tuple[Dict[int, List[np.ndarray]], float]:
+    """使用ffmpeg pipe流式读取视频帧，计算pHash，不保存原始帧到内存。fps=0 表示使用视频原始帧率。use_ffmpeg_resize=True 时，ffmpeg 输出 32x32 帧；False 时，输出原始分辨率帧。"""
 
     # 获取视频宽高和帧率
     probe_cmd = [
@@ -63,7 +88,14 @@ def extract_phashes(video_path: str, fps: float = 0, hash_size=16) -> tuple[List
     else:
         actual_fps = fps
 
-    # 用ffmpeg pipe输出raw RGB帧
+    if use_ffmpeg_resize:
+        output_width, output_height = 32, 32
+        vf_filter = f"fps={actual_fps},scale={output_width}:{output_height}"
+    else:
+        output_width, output_height = width, height
+        vf_filter = f"fps={actual_fps}"
+
+    # 用ffmpeg pipe输出raw BGR帧
     ffmpeg_cmd = [
         "ffmpeg",
         "-hwaccel",
@@ -71,77 +103,65 @@ def extract_phashes(video_path: str, fps: float = 0, hash_size=16) -> tuple[List
         "-i",
         video_path,
         "-vf",
-        f"fps={actual_fps}",
+        vf_filter,
         "-f",
         "image2pipe",
         "-pix_fmt",
-        "rgb24",
+        "bgr24",
         "-vcodec",
         "rawvideo",
         "-",
     ]
-    # proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    # Showing stderr to user may help debug ffmpeg issues
     proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE)
-    frame_size = width * height * 3
-    phashes = []
-    while True:
-        raw = proc.stdout.read(frame_size)
-        if len(raw) < frame_size:
-            break
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
-        phash = calculate_phash(frame, hash_size)
-        phashes.append(phash)
-    proc.stdout.close()
-    proc.wait()
+    frame_size = output_width * output_height * 3
+    frame_queues = [queue.Queue(maxsize=10) for _ in hash_sizes]  # one queue per worker
+    phashes = {hs: [] for hs in hash_sizes}
+
+    # start reader thread
+    reader_thread = threading.Thread(target=frame_reader, args=(proc, frame_size, output_height, output_width, frame_queues))
+    reader_thread.start()
+
+    # start worker threads
+    worker_threads = []
+    for i, hs in enumerate(hash_sizes):
+        t = threading.Thread(target=phash_worker, args=(hs, frame_queues[i], phashes))
+        t.start()
+        worker_threads.append(t)
+
+    # wait for all threads
+    reader_thread.join()
+    for t in worker_threads:
+        t.join()
+
     print(
-        f"Extracted and computed {len(phashes)} pHashes from `{video_path}` at {actual_fps} fps."
+        f"Extracted and computed pHashes for hash_sizes {hash_sizes} from `{video_path}` at {actual_fps} fps (ffmpeg_resize={use_ffmpeg_resize})."
     )
     return phashes, actual_fps
 
-def process_videos(video_paths: List[str], workdir: str, hash_size=16):
+def process_videos(video_paths: List[str], workdir: str):
     """处理视频，提取帧，计算pHash，保存到本地文件。"""
     os.makedirs(workdir, exist_ok=True)
+    hash_sizes = [8, 12, 16]
     for video_path in video_paths:
         video_name = Path(video_path).stem
         print(f"Processing video: {video_name}")
-        phashes, fps = extract_phashes(video_path, hash_size=hash_size)
-        
-        # 【修改】
-        # phashes 现在是一个列表，每个元素是 (32,) 的 uint8 数组
-        # np.array(phashes) 会自动创建一个 (N_frames, 32) 的 uint8 数组
-        # 原代码: phash_array = np.array(phashes, dtype=np.uint64)
-        phash_array = np.array(phashes, dtype=np.uint8) # 显式指定 dtype
+        phashes_dict, fps = extract_phashes(video_path, hash_sizes, use_ffmpeg_resize=True)
+        phashes_data = {f'phashes_{hs}': np.array(phashes_dict[hs], dtype=np.uint8) for hs in hash_sizes}
         feature_file = os.path.join(workdir, f"{video_name}_phashes.npz")
-        np.savez(feature_file, phashes=phash_array, fps=fps)
+        np.savez(feature_file, **phashes_data, fps=fps)
         print(f"Saved pHashes and fps for `{video_name}` to `{feature_file}`.")
-        print(f"Number of frames: {len(phashes)}, FPS: {fps}")
+        print(f"Number of frames: {len(phashes_dict[hash_sizes[0]])}, FPS: {fps}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python process-videos.py <video_path1> <video_path2> ... [--hash_size <size>]")
+        print("Usage: python process-videos.py <video_path1> <video_path2> ...")
         sys.exit(1)
 
-    video_paths = []
-    hash_size = 16
-    i = 1
-    while i < len(sys.argv):
-        if sys.argv[i] == '--hash_size':
-            if i + 1 < len(sys.argv):
-                hash_size = int(sys.argv[i + 1])
-                i += 2
-            else:
-                print("Error: --hash_size requires a value")
-                sys.exit(1)
-        else:
-            video_paths.append(sys.argv[i])
-            i += 1
+    video_paths = sys.argv[1:]
 
     if not video_paths:
         print("No video paths provided")
         sys.exit(1)
 
-    print("Using pHash size =", hash_size)
-
     workdir = "workdir"
-    process_videos(video_paths, workdir, hash_size)
+    process_videos(video_paths, workdir)
