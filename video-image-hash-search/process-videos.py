@@ -90,16 +90,24 @@ def extract_phashes(video_path: str, hash_sizes: List[int], fps: float = 0, use_
 
     if use_ffmpeg_resize:
         output_width, output_height = 32, 32
-        vf_filter = f"fps={actual_fps},scale={output_width}:{output_height}"
+        vf_filter = f"hwdownload,format=nv12,fps={actual_fps},scale={output_width}:{output_height}:flags=area,format=bgr24"
+        hwaccel = "qsv"
+        hwaccel_output_format = "qsv"
     else:
         output_width, output_height = width, height
         vf_filter = f"fps={actual_fps}"
+        hwaccel = "auto"
+        hwaccel_output_format = None
 
     # 用ffmpeg pipe输出raw BGR帧
     ffmpeg_cmd = [
         "ffmpeg",
         "-hwaccel",
-        "auto",
+        hwaccel,
+    ]
+    if hwaccel_output_format:
+        ffmpeg_cmd.extend(["-hwaccel_output_format", hwaccel_output_format])
+    ffmpeg_cmd.extend([
         "-i",
         video_path,
         "-vf",
@@ -111,7 +119,7 @@ def extract_phashes(video_path: str, hash_sizes: List[int], fps: float = 0, use_
         "-vcodec",
         "rawvideo",
         "-",
-    ]
+    ])
     proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE)
     frame_size = output_width * output_height * 3
     frame_queues = [queue.Queue(maxsize=10) for _ in hash_sizes]  # one queue per worker
